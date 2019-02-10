@@ -1,84 +1,80 @@
-///
-/// JWT Handling
-///
+//
+// JWT Handling
+//
 use crate::util::read_file;
-use chrono::Duration;
+use chrono::{Duration, Utc};
 
 use jsonwebtoken::{self, Algorithm, Header};
+use serde::de::DeserializeOwned;
 use serde::ser::Serialize;
 
+use crate::error::{Error, MapResult};
 use crate::CONFIG;
 
 const JWT_ALGORITHM: Algorithm = Algorithm::RS256;
 
 lazy_static! {
     pub static ref DEFAULT_VALIDITY: Duration = Duration::hours(2);
-    pub static ref JWT_ISSUER: String = CONFIG.domain.clone();
-
     static ref JWT_HEADER: Header = Header::new(JWT_ALGORITHM);
-
-    static ref PRIVATE_RSA_KEY: Vec<u8> = match read_file(&CONFIG.private_rsa_key) {
+    pub static ref JWT_LOGIN_ISSUER: String = format!("{}|login", CONFIG.domain());
+    pub static ref JWT_INVITE_ISSUER: String = format!("{}|invite", CONFIG.domain());
+    pub static ref JWT_ADMIN_ISSUER: String = format!("{}|admin", CONFIG.domain());
+    static ref PRIVATE_RSA_KEY: Vec<u8> = match read_file(&CONFIG.private_rsa_key()) {
         Ok(key) => key,
-        Err(e) => panic!("Error loading private RSA Key from {}\n Error: {}", CONFIG.private_rsa_key, e)
+        Err(e) => panic!(
+            "Error loading private RSA Key from {}\n Error: {}",
+            CONFIG.private_rsa_key(), e
+        ),
     };
-
-    static ref PUBLIC_RSA_KEY: Vec<u8> = match read_file(&CONFIG.public_rsa_key) {
+    static ref PUBLIC_RSA_KEY: Vec<u8> = match read_file(&CONFIG.public_rsa_key()) {
         Ok(key) => key,
-        Err(e) => panic!("Error loading public RSA Key from {}\n Error: {}", CONFIG.public_rsa_key, e)
+        Err(e) => panic!(
+            "Error loading public RSA Key from {}\n Error: {}",
+            CONFIG.public_rsa_key(), e
+        ),
     };
 }
 
 pub fn encode_jwt<T: Serialize>(claims: &T) -> String {
     match jsonwebtoken::encode(&JWT_HEADER, claims, &PRIVATE_RSA_KEY) {
         Ok(token) => token,
-        Err(e) => panic!("Error encoding jwt {}", e)
+        Err(e) => panic!("Error encoding jwt {}", e),
     }
 }
 
-pub fn decode_jwt(token: &str) -> Result<JWTClaims, String> {
+fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Error> {
     let validation = jsonwebtoken::Validation {
         leeway: 30, // 30 seconds
         validate_exp: true,
         validate_iat: false, // IssuedAt is the same as NotBefore
         validate_nbf: true,
         aud: None,
-        iss: Some(JWT_ISSUER.clone()),
+        iss: Some(issuer),
         sub: None,
         algorithms: vec![JWT_ALGORITHM],
     };
 
-    match jsonwebtoken::decode(token, &PUBLIC_RSA_KEY, &validation) {
-        Ok(decoded) => Ok(decoded.claims),
-        Err(msg) => {
-            error!("Error validating jwt - {:#?}", msg);
-            Err(msg.to_string())
-        }
-    }
+    let token = token.replace(char::is_whitespace, "");
+
+    jsonwebtoken::decode(&token, &PUBLIC_RSA_KEY, &validation)
+        .map(|d| d.claims)
+        .map_res("Error decoding JWT")
 }
 
-pub fn decode_invite_jwt(token: &str) -> Result<InviteJWTClaims, String> {
-    let validation = jsonwebtoken::Validation {
-        leeway: 30, // 30 seconds
-        validate_exp: true,
-        validate_iat: false, // IssuedAt is the same as NotBefore
-        validate_nbf: true,
-        aud: None,
-        iss: Some(JWT_ISSUER.clone()),
-        sub: None,
-        algorithms: vec![JWT_ALGORITHM],
-    };
+pub fn decode_login(token: &str) -> Result<LoginJWTClaims, Error> {
+    decode_jwt(token, JWT_LOGIN_ISSUER.to_string())
+}
 
-    match jsonwebtoken::decode(token, &PUBLIC_RSA_KEY, &validation) {
-        Ok(decoded) => Ok(decoded.claims),
-        Err(msg) => {
-            error!("Error validating jwt - {:#?}", msg);
-            Err(msg.to_string())
-        }
-    }
+pub fn decode_invite(token: &str) -> Result<InviteJWTClaims, Error> {
+    decode_jwt(token, JWT_INVITE_ISSUER.to_string())
+}
+
+pub fn decode_admin(token: &str) -> Result<AdminJWTClaims, Error> {
+    decode_jwt(token, JWT_ADMIN_ISSUER.to_string())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct JWTClaims {
+pub struct LoginJWTClaims {
     // Not before
     pub nbf: i64,
     // Expiration time
@@ -120,18 +116,61 @@ pub struct InviteJWTClaims {
     pub sub: String,
 
     pub email: String,
-    pub org_id: String,
+    pub org_id: Option<String>,
     pub user_org_id: Option<String>,
+    pub invited_by_email: Option<String>,
 }
 
-///
-/// Bearer token authentication
-///
-use rocket::Outcome;
-use rocket::request::{self, Request, FromRequest};
+pub fn generate_invite_claims(
+    uuid: String,
+    email: String,
+    org_id: Option<String>,
+    org_user_id: Option<String>,
+    invited_by_email: Option<String>,
+) -> InviteJWTClaims {
+    let time_now = Utc::now().naive_utc();
+    InviteJWTClaims {
+        nbf: time_now.timestamp(),
+        exp: (time_now + Duration::days(5)).timestamp(),
+        iss: JWT_INVITE_ISSUER.to_string(),
+        sub: uuid.clone(),
+        email: email.clone(),
+        org_id: org_id.clone(),
+        user_org_id: org_user_id.clone(),
+        invited_by_email: invited_by_email.clone(),
+    }
+}
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct AdminJWTClaims {
+    // Not before
+    pub nbf: i64,
+    // Expiration time
+    pub exp: i64,
+    // Issuer
+    pub iss: String,
+    // Subject
+    pub sub: String,
+}
+
+pub fn generate_admin_claims() -> AdminJWTClaims {
+    let time_now = Utc::now().naive_utc();
+    AdminJWTClaims {
+        nbf: time_now.timestamp(),
+        exp: (time_now + Duration::minutes(20)).timestamp(),
+        iss: JWT_ADMIN_ISSUER.to_string(),
+        sub: "admin_panel".to_string(),
+    }
+}
+
+//
+// Bearer token authentication
+//
+use rocket::request::{self, FromRequest, Request};
+use rocket::Outcome;
+
+use crate::db::models::{Device, User, UserOrgStatus, UserOrgType, UserOrganization};
 use crate::db::DbConn;
-use crate::db::models::{User, Organization, UserOrganization, UserOrgType, UserOrgStatus, Device};
 
 pub struct Headers {
     pub host: String,
@@ -146,11 +185,11 @@ impl<'a, 'r> FromRequest<'a, 'r> for Headers {
         let headers = request.headers();
 
         // Get host
-        let host = if CONFIG.domain_set {
-            CONFIG.domain.clone()
+        let host = if CONFIG.domain_set() {
+            CONFIG.domain()
         } else if let Some(referer) = headers.get_one("Referer") {
             referer.to_string()
-        } else {   
+        } else {
             // Try to guess from the headers
             use std::env;
 
@@ -174,7 +213,7 @@ impl<'a, 'r> FromRequest<'a, 'r> for Headers {
         };
 
         // Get access_token
-        let access_token: &str = match request.headers().get_one("Authorization") {
+        let access_token: &str = match headers.get_one("Authorization") {
             Some(a) => match a.rsplit("Bearer ").next() {
                 Some(split) => split,
                 None => err_handler!("No access token provided"),
@@ -183,9 +222,9 @@ impl<'a, 'r> FromRequest<'a, 'r> for Headers {
         };
 
         // Check JWT token is valid and get device and user from it
-        let claims: JWTClaims = match decode_jwt(access_token) {
+        let claims = match decode_login(access_token) {
             Ok(claims) => claims,
-            Err(_) => err_handler!("Invalid claim")
+            Err(_) => err_handler!("Invalid claim"),
         };
 
         let device_uuid = claims.device;
@@ -193,17 +232,17 @@ impl<'a, 'r> FromRequest<'a, 'r> for Headers {
 
         let conn = match request.guard::<DbConn>() {
             Outcome::Success(conn) => conn,
-            _ => err_handler!("Error getting DB")
+            _ => err_handler!("Error getting DB"),
         };
 
         let device = match Device::find_by_uuid(&device_uuid, &conn) {
             Some(device) => device,
-            None => err_handler!("Invalid device id")
+            None => err_handler!("Invalid device id"),
         };
 
         let user = match User::find_by_uuid(&user_uuid, &conn) {
             Some(user) => user,
-            None => err_handler!("Device has no user associated")
+            None => err_handler!("Device has no user associated"),
         };
 
         if user.security_stamp != claims.sstamp {
@@ -234,10 +273,11 @@ impl<'a, 'r> FromRequest<'a, 'r> for OrgHeaders {
                     Some(Ok(org_id)) => {
                         let conn = match request.guard::<DbConn>() {
                             Outcome::Success(conn) => conn,
-                            _ => err_handler!("Error getting DB")
+                            _ => err_handler!("Error getting DB"),
                         };
 
-                        let org_user = match UserOrganization::find_by_user_and_org(&headers.user.uuid, &org_id, &conn) {
+                        let user = headers.user;
+                        let org_user = match UserOrganization::find_by_user_and_org(&user.uuid, &org_id, &conn) {
                             Some(user) => {
                                 if user.status == UserOrgStatus::Confirmed as i32 {
                                     user
@@ -245,28 +285,23 @@ impl<'a, 'r> FromRequest<'a, 'r> for OrgHeaders {
                                     err_handler!("The current user isn't confirmed member of the organization")
                                 }
                             }
-                            None => {
-                                if headers.user.is_server_admin() && org_id == Organization::VIRTUAL_ID {
-                                    UserOrganization::new_virtual(headers.user.uuid.clone(), UserOrgType::Owner, UserOrgStatus::Confirmed)
-                                } else {
-                                    err_handler!("The current user isn't member of the organization")
-                                }
-                            }
+                            None => err_handler!("The current user isn't member of the organization"),
                         };
 
-                        Outcome::Success(Self{
+                        Outcome::Success(Self {
                             host: headers.host,
                             device: headers.device,
-                            user: headers.user,
-                            org_user_type: { 
+                            user,
+                            org_user_type: {
                                 if let Some(org_usr_type) = UserOrgType::from_i32(org_user.type_) {
                                     org_usr_type
-                                } else { // This should only happen if the DB is corrupted
+                                } else {
+                                    // This should only happen if the DB is corrupted
                                     err_handler!("Unknown user type in the database")
                                 }
                             },
                         })
-                    },
+                    }
                     _ => err_handler!("Error getting the organization id"),
                 }
             }
@@ -332,9 +367,9 @@ impl<'a, 'r> FromRequest<'a, 'r> for OwnerHeaders {
     }
 }
 
-///
-/// Client IP address detection
-///
+//
+// Client IP address detection
+//
 use std::net::IpAddr;
 
 pub struct ClientIp {

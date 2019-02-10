@@ -1,76 +1,93 @@
-///
-/// Macros
-///
-#[macro_export]
-macro_rules! _err_object {
-    ($msg:expr) => {{
-        err_json!(json!({
-            "Message": "",
-            "error": "",
-            "error_description": "",
-            "ValidationErrors": {"": [ $msg ]},
-            "ErrorModel": {
-                "Message": $msg,
-                "Object": "error"
-            },
-            "Object": "error"
-        }))
-    }};
+//
+// Web Headers and caching
+//
+use rocket::fairing::{Fairing, Info, Kind};
+use rocket::response::{self, Responder};
+use rocket::{Request, Response};
+
+pub struct AppHeaders();
+
+impl Fairing for AppHeaders {
+    fn info(&self) -> Info {
+        Info {
+            name: "Application Headers",
+            kind: Kind::Response,
+        }
+    }
+
+    fn on_response(&self, _req: &Request, res: &mut Response) {
+        res.set_raw_header("Feature-Policy", "accelerometer 'none'; ambient-light-sensor 'none'; autoplay 'none'; camera 'none'; encrypted-media 'none'; fullscreen 'none'; geolocation 'none'; gyroscope 'none'; magnetometer 'none'; microphone 'none'; midi 'none'; payment 'none'; picture-in-picture 'none'; sync-xhr 'self' https://haveibeenpwned.com https://twofactorauth.org; usb 'none'; vr 'none'");
+        res.set_raw_header("Referrer-Policy", "same-origin");
+        res.set_raw_header("X-Frame-Options", "SAMEORIGIN");
+        res.set_raw_header("X-Content-Type-Options", "nosniff");
+        res.set_raw_header("X-XSS-Protection", "1; mode=block");
+        let csp = "frame-ancestors 'self' chrome-extension://nngceckbapebfimnlniiiahkandclblb moz-extension://*;";
+        res.set_raw_header("Content-Security-Policy", csp);
+
+        // Disable cache unless otherwise specified
+        if !res.headers().contains("cache-control") {
+            res.set_raw_header("Cache-Control", "no-cache, no-store, max-age=0");
+        }
+    }
 }
 
-#[macro_export]
-macro_rules! err {
-    ($msg:expr) => {{
-        error!("{}", $msg);
-        _err_object!($msg)
-    }};
-    ($usr_msg:expr, $log_value:expr) => {{
-        error!("{}: {:#?}", $usr_msg, $log_value);
-        _err_object!($usr_msg)
-    }}
+pub struct Cached<R>(R, &'static str);
+
+impl<R> Cached<R> {
+    pub fn long(r: R) -> Cached<R> {
+        // 7 days
+        Cached(r, "public, max-age=604800")
+    }
+
+    pub fn short(r: R) -> Cached<R> {
+        // 10 minutes
+        Cached(r, "public, max-age=600")
+    }
 }
 
-#[macro_export]
-macro_rules! err_json {
-    ($expr:expr) => {{
-        return Err(rocket::response::status::BadRequest(Some(rocket_contrib::json::Json($expr))));
-    }}
+impl<'r, R: Responder<'r>> Responder<'r> for Cached<R> {
+    fn respond_to(self, req: &Request) -> response::Result<'r> {
+        match self.0.respond_to(req) {
+            Ok(mut res) => {
+                res.set_raw_header("Cache-Control", self.1);
+                Ok(res)
+            }
+            e @ Err(_) => e,
+        }
+    }
 }
 
-#[macro_export]
-macro_rules! err_handler {
-    ($expr:expr) => {{
-        error!("{}", $expr);
-        return rocket::Outcome::Failure((rocket::http::Status::Unauthorized, $expr));
-    }}
-}
-
-///
-/// File handling
-///
-
-use std::path::Path;
-use std::io::Read;
+//
+// File handling
+//
 use std::fs::{self, File};
+use std::io::{Read, Result as IOResult};
+use std::path::Path;
 
 pub fn file_exists(path: &str) -> bool {
     Path::new(path).exists()
 }
 
-pub fn read_file(path: &str) -> Result<Vec<u8>, String> {
-    let mut file = File::open(Path::new(path))
-        .map_err(|e| format!("Error opening file: {}", e))?;
-
+pub fn read_file(path: &str) -> IOResult<Vec<u8>> {
     let mut contents: Vec<u8> = Vec::new();
 
-    file.read_to_end(&mut contents)
-        .map_err(|e| format!("Error reading file: {}", e))?;
+    let mut file = File::open(Path::new(path))?;
+    file.read_to_end(&mut contents)?;
 
     Ok(contents)
 }
 
-pub fn delete_file(path: &str) -> bool {
-    let res = fs::remove_file(path).is_ok();
+pub fn read_file_string(path: &str) -> IOResult<String> {
+    let mut contents = String::new();
+
+    let mut file = File::open(Path::new(path))?;
+    file.read_to_string(&mut contents)?;
+
+    Ok(contents)
+}
+
+pub fn delete_file(path: &str) -> IOResult<()> {
+    let res = fs::remove_file(path);
 
     if let Some(parent) = Path::new(path).parent() {
         // If the directory isn't empty, this returns an error, which we ignore
@@ -80,7 +97,6 @@ pub fn delete_file(path: &str) -> bool {
 
     res
 }
-
 
 const UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
 
@@ -95,7 +111,7 @@ pub fn get_display_size(size: i32) -> String {
         } else {
             break;
         }
-    };
+    }
 
     // Round to two decimals
     size = (size * 100.).round() / 100.;
@@ -106,13 +122,12 @@ pub fn get_uuid() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
+//
+// String util methods
+//
 
-///
-/// String util methods
-///
-
-use std::str::FromStr;
 use std::ops::Try;
+use std::str::FromStr;
 
 pub fn upcase_first(s: &str) -> String {
     let mut c = s.chars();
@@ -122,7 +137,11 @@ pub fn upcase_first(s: &str) -> String {
     }
 }
 
-pub fn try_parse_string<S, T, U>(string: impl Try<Ok = S, Error=U>) -> Option<T> where S: AsRef<str>, T: FromStr {
+pub fn try_parse_string<S, T, U>(string: impl Try<Ok = S, Error = U>) -> Option<T>
+where
+    S: AsRef<str>,
+    T: FromStr,
+{
     if let Ok(Ok(value)) = string.into_result().map(|s| s.as_ref().parse::<T>()) {
         Some(value)
     } else {
@@ -130,32 +149,22 @@ pub fn try_parse_string<S, T, U>(string: impl Try<Ok = S, Error=U>) -> Option<T>
     }
 }
 
-pub fn try_parse_string_or<S, T, U>(string: impl Try<Ok = S, Error=U>, default: T) -> T where S: AsRef<str>, T: FromStr {
-    if let Ok(Ok(value)) = string.into_result().map(|s| s.as_ref().parse::<T>()) {
-        value
-    } else {
-        default
-    }
-}
-
-
-///
-/// Env methods
-/// 
+//
+// Env methods
+//
 
 use std::env;
 
-pub fn get_env<V>(key: &str) -> Option<V> where V: FromStr {
+pub fn get_env<V>(key: &str) -> Option<V>
+where
+    V: FromStr,
+{
     try_parse_string(env::var(key))
 }
 
-pub fn get_env_or<V>(key: &str, default: V) -> V where V: FromStr {
-    try_parse_string_or(env::var(key), default)
-}
-
-///
-/// Date util methods
-///
+//
+// Date util methods
+//
 
 use chrono::NaiveDateTime;
 
@@ -165,9 +174,9 @@ pub fn format_date(date: &NaiveDateTime) -> String {
     date.format(DATETIME_FORMAT).to_string()
 }
 
-///
-/// Deserialization methods
-///
+//
+// Deserialization methods
+//
 
 use std::fmt;
 
@@ -183,10 +192,11 @@ pub struct UpCase<T: DeserializeOwned> {
     pub data: T,
 }
 
-/// https://github.com/serde-rs/serde/issues/586
+// https://github.com/serde-rs/serde/issues/586
 pub fn upcase_deserialize<'de, T, D>(deserializer: D) -> Result<T, D::Error>
-    where T: DeserializeOwned,
-          D: Deserializer<'de>
+where
+    T: DeserializeOwned,
+    D: Deserializer<'de>,
 {
     let d = deserializer.deserialize_any(UpCaseVisitor)?;
     T::deserialize(d).map_err(de::Error::custom)
@@ -202,7 +212,8 @@ impl<'de> Visitor<'de> for UpCaseVisitor {
     }
 
     fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
-        where A: MapAccess<'de>
+    where
+        A: MapAccess<'de>,
     {
         let mut result_map = JsonMap::new();
 
@@ -214,7 +225,9 @@ impl<'de> Visitor<'de> for UpCaseVisitor {
     }
 
     fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-        where A: SeqAccess<'de> {
+    where
+        A: SeqAccess<'de>,
+    {
         let mut result_seq = Vec::<Value>::new();
 
         while let Some(value) = seq.next_element()? {
@@ -228,13 +241,12 @@ impl<'de> Visitor<'de> for UpCaseVisitor {
 fn upcase_value(value: &Value) -> Value {
     if let Some(map) = value.as_object() {
         let mut new_value = json!({});
-        
+
         for (key, val) in map {
             let processed_key = _process_key(key);
             new_value[processed_key] = upcase_value(val);
         }
         new_value
-    
     } else if let Some(array) = value.as_array() {
         // Initialize array with null values
         let mut new_value = json!(vec![Value::Null; array.len()]);
@@ -243,7 +255,6 @@ fn upcase_value(value: &Value) -> Value {
             new_value[index] = upcase_value(val);
         }
         new_value
-    
     } else {
         value.clone()
     }

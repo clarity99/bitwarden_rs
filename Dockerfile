@@ -4,7 +4,7 @@
 ####################### VAULT BUILD IMAGE  #######################
 FROM alpine as vault
 
-ENV VAULT_VERSION "v2.7.1"
+ENV VAULT_VERSION "v2.8.0d"
 
 ENV URL "https://github.com/dani-garcia/bw_web_builds/releases/download/$VAULT_VERSION/bw_web_$VAULT_VERSION.tar.gz"
 
@@ -33,9 +33,10 @@ FROM rust as build
 RUN USER=root cargo new --bin app
 WORKDIR /app
 
-# Copies over *only* your manifests and vendored dependencies
+# Copies over *only* your manifests and build files
 COPY ./Cargo.* ./
 COPY ./rust-toolchain ./rust-toolchain
+COPY ./build.rs ./build.rs
 
 # Builds your dependencies and removes the
 # dummy project, except the target folder
@@ -75,9 +76,8 @@ VOLUME /data
 EXPOSE 80
 EXPOSE 3012
 
-# Copies the files from the context (env file and web-vault)
+# Copies the files from the context (Rocket.toml file and web-vault)
 # and the binary from the "build" stage to the current stage
-COPY .env .
 COPY Rocket.toml .
 COPY --from=vault /web-vault ./web-vault
 COPY --from=build app/target/release/bitwarden_rs .

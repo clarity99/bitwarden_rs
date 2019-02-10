@@ -8,10 +8,10 @@ pub fn routes() -> Vec<Route> {
     let mut mod_routes = routes![
         clear_device_token,
         put_device_token,
-
         get_eq_domains,
         post_eq_domains,
         put_eq_domains,
+        hibp_breach,
     ];
 
     let mut routes = Vec::new();
@@ -25,9 +25,9 @@ pub fn routes() -> Vec<Route> {
     routes
 }
 
-///
-/// Move this somewhere else
-///
+//
+// Move this somewhere else
+//
 use rocket::Route;
 
 use rocket_contrib::json::Json;
@@ -77,7 +77,7 @@ struct GlobalDomain {
     Excluded: bool,
 }
 
-const GLOBAL_DOMAINS: &str = include_str!("global_domains.json");
+const GLOBAL_DOMAINS: &str = include_str!("../../static/global_domains.json");
 
 #[get("/settings/domains")]
 fn get_eq_domains(headers: Headers) -> JsonResult {
@@ -117,16 +117,32 @@ fn post_eq_domains(data: JsonUpcase<EquivDomainData>, headers: Headers, conn: Db
     let mut user = headers.user;
     use serde_json::to_string;
 
-    user.excluded_globals = to_string(&excluded_globals).unwrap_or("[]".to_string());
-    user.equivalent_domains = to_string(&equivalent_domains).unwrap_or("[]".to_string());
+    user.excluded_globals = to_string(&excluded_globals).unwrap_or_else(|_| "[]".to_string());
+    user.equivalent_domains = to_string(&equivalent_domains).unwrap_or_else(|_| "[]".to_string());
 
-    match user.save(&conn) {
-        Ok(()) => Ok(Json(json!({}))),
-        Err(_) => err!("Failed to save user"),
-    }
+    user.save(&conn)?;
+
+    Ok(Json(json!({})))
 }
 
 #[put("/settings/domains", data = "<data>")]
 fn put_eq_domains(data: JsonUpcase<EquivDomainData>, headers: Headers, conn: DbConn) -> JsonResult {
     post_eq_domains(data, headers, conn)
+}
+
+#[get("/hibp/breach?<username>")]
+fn hibp_breach(username: String) -> JsonResult {
+    let url = format!("https://haveibeenpwned.com/api/v2/breachedaccount/{}", username);
+    let user_agent = "Bitwarden_RS";
+
+    use reqwest::{header::USER_AGENT, Client};
+
+    let value: Value = Client::new()
+        .get(&url)
+        .header(USER_AGENT, user_agent)
+        .send()?
+        .error_for_status()?
+        .json()?;
+
+    Ok(Json(value))
 }
