@@ -37,6 +37,12 @@ pub struct User {
     pub client_kdf_iter: i32,
 }
 
+enum UserStatus {
+    Enabled = 0,
+    Invited = 1,
+    _Disabled = 2,
+}
+
 /// Local methods
 impl User {
     pub const CLIENT_KDF_TYPE_DEFAULT: i32 = 0; // PBKDF2: 0
@@ -86,7 +92,7 @@ impl User {
 
     pub fn check_valid_recovery_code(&self, recovery_code: &str) -> bool {
         if let Some(ref totp_recover) = self.totp_recover {
-            recovery_code == totp_recover.to_lowercase()
+            crate::crypto::ct_eq(recovery_code, totp_recover.to_lowercase())
         } else {
             false
         }
@@ -113,14 +119,19 @@ use crate::error::MapResult;
 /// Database methods
 impl User {
     pub fn to_json(&self, conn: &DbConn) -> Value {
-        use super::{TwoFactor, UserOrganization};
-
         let orgs = UserOrganization::find_by_user(&self.uuid, conn);
         let orgs_json: Vec<Value> = orgs.iter().map(|c| c.to_json(&conn)).collect();
         let twofactor_enabled = !TwoFactor::find_by_user(&self.uuid, conn).is_empty();
 
+        // TODO: Might want to save the status field in the DB
+        let status = if self.password_hash.is_empty() {
+            UserStatus::Invited
+        } else {
+            UserStatus::Enabled
+        };
+
         json!({
-            "_Enabled": !self.password_hash.is_empty(),
+            "_Status": status as i32,
             "Id": self.uuid,
             "Name": self.name,
             "Email": self.email,
@@ -178,6 +189,20 @@ impl User {
         }
     }
 
+    pub fn update_all_revisions(conn: &DbConn) -> EmptyResult {
+        let updated_at = Utc::now().naive_utc();
+
+        crate::util::retry(
+            || {
+                diesel::update(users::table)
+                    .set(users::updated_at.eq(updated_at))
+                    .execute(&**conn)
+            },
+            10,
+        )
+        .map_res("Error updating revision date for all users")
+    }
+
     pub fn update_revision(&mut self, conn: &DbConn) -> EmptyResult {
         self.updated_at = Utc::now().naive_utc();
 
@@ -225,13 +250,13 @@ impl Invitation {
         Self { email }
     }
 
-    pub fn save(&mut self, conn: &DbConn) -> EmptyResult {
+    pub fn save(&self, conn: &DbConn) -> EmptyResult {
         if self.email.trim().is_empty() {
             err!("Invitation email can't be empty")
         }
 
         diesel::replace_into(invitations::table)
-            .values(&*self)
+            .values(self)
             .execute(&**conn)
             .map_res("Error saving invitation")
     }

@@ -1,8 +1,9 @@
 use lettre::smtp::authentication::Credentials;
 use lettre::smtp::ConnectionReuseParameters;
 use lettre::{ClientSecurity, ClientTlsParameters, SmtpClient, SmtpTransport, Transport};
-use lettre_email::EmailBuilder;
+use lettre_email::{EmailBuilder, MimeMultipartType, PartBuilder};
 use native_tls::{Protocol, TlsConnector};
+use quoted_printable::encode_to_str;
 
 use crate::api::EmptyResult;
 use crate::auth::{encode_jwt, generate_invite_claims};
@@ -18,7 +19,13 @@ fn mailer() -> SmtpTransport {
             .build()
             .unwrap();
 
-        ClientSecurity::Required(ClientTlsParameters::new(host.clone(), tls))
+        let params = ClientTlsParameters::new(host.clone(), tls);
+
+        if CONFIG.smtp_explicit_tls() {
+            ClientSecurity::Wrapper(params)
+        } else {
+            ClientSecurity::Required(params)
+        }
     } else {
         ClientSecurity::None
     };
@@ -36,8 +43,14 @@ fn mailer() -> SmtpTransport {
         .transport()
 }
 
-fn get_text(template_name: &'static str, data: serde_json::Value) -> Result<(String, String), Error> {
-    let text = CONFIG.render_template(template_name, &data)?;
+fn get_text(template_name: &'static str, data: serde_json::Value) -> Result<(String, String, String), Error> {
+    let (subject_html, body_html) = get_template(&format!("{}.html", template_name), &data)?;
+    let (_subject_text, body_text) = get_template(template_name, &data)?;
+    Ok((subject_html, body_html, body_text))
+}
+
+fn get_template(template_name: &str, data: &serde_json::Value) -> Result<(String, String), Error> {
+    let text = CONFIG.render_template(template_name, data)?;
     let mut text_split = text.split("<!---------------->");
 
     let subject = match text_split.next() {
@@ -60,9 +73,9 @@ pub fn send_password_hint(address: &str, hint: Option<String>) -> EmptyResult {
         "email/pw_hint_none"
     };
 
-    let (subject, body) = get_text(template_name, json!({ "hint": hint }))?;
+    let (subject, body_html, body_text) = get_text(template_name, json!({ "hint": hint, "url": CONFIG.domain() }))?;
 
-    send_email(&address, &subject, &body)
+    send_email(&address, &subject, &body_html, &body_text)
 }
 
 pub fn send_invite(
@@ -82,7 +95,7 @@ pub fn send_invite(
     );
     let invite_token = encode_jwt(&claims);
 
-    let (subject, body) = get_text(
+    let (subject, body_html, body_text) = get_text(
         "email/send_org_invite",
         json!({
             "url": CONFIG.domain(),
@@ -94,11 +107,11 @@ pub fn send_invite(
         }),
     )?;
 
-    send_email(&address, &subject, &body)
+    send_email(&address, &subject, &body_html, &body_text)
 }
 
 pub fn send_invite_accepted(new_user_email: &str, address: &str, org_name: &str) -> EmptyResult {
-    let (subject, body) = get_text(
+    let (subject, body_html, body_text) = get_text(
         "email/invite_accepted",
         json!({
             "url": CONFIG.domain(),
@@ -107,11 +120,11 @@ pub fn send_invite_accepted(new_user_email: &str, address: &str, org_name: &str)
         }),
     )?;
 
-    send_email(&address, &subject, &body)
+    send_email(&address, &subject, &body_html, &body_text)
 }
 
 pub fn send_invite_confirmed(address: &str, org_name: &str) -> EmptyResult {
-    let (subject, body) = get_text(
+    let (subject, body_html, body_text) = get_text(
         "email/invite_confirmed",
         json!({
             "url": CONFIG.domain(),
@@ -119,21 +132,43 @@ pub fn send_invite_confirmed(address: &str, org_name: &str) -> EmptyResult {
         }),
     )?;
 
-    send_email(&address, &subject, &body)
+    send_email(&address, &subject, &body_html, &body_text)
 }
 
-fn send_email(address: &str, subject: &str, body: &str) -> EmptyResult {
+fn send_email(address: &str, subject: &str, body_html: &str, body_text: &str) -> EmptyResult {
+    let html = PartBuilder::new()
+        .body(encode_to_str(body_html))
+        .header(("Content-Type", "text/html; charset=utf-8"))
+        .header(("Content-Transfer-Encoding", "quoted-printable"))
+        .build();
+
+    let text = PartBuilder::new()
+        .body(encode_to_str(body_text))
+        .header(("Content-Type", "text/plain; charset=utf-8"))
+        .header(("Content-Transfer-Encoding", "quoted-printable"))
+        .build();
+
+    let alternative = PartBuilder::new()
+        .message_type(MimeMultipartType::Alternative)
+        .child(text)
+        .child(html);
+
     let email = EmailBuilder::new()
         .to(address)
         .from((CONFIG.smtp_from().as_str(), CONFIG.smtp_from_name().as_str()))
         .subject(subject)
-        .header(("Content-Type", "text/html"))
-        .body(body)
+        .child(alternative.build())
         .build()
         .map_err(|e| Error::new("Error building email", e.to_string()))?;
 
-    mailer()
+    let mut transport = mailer();
+
+    let result = transport
         .send(email.into())
         .map_err(|e| Error::new("Error sending email", e.to_string()))
-        .and(Ok(()))
+        .and(Ok(()));
+
+    // Explicitly close the connection, in case of error
+    transport.close();
+    result
 }
