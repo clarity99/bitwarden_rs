@@ -40,7 +40,6 @@ fn decode_jwt<T: DeserializeOwned>(token: &str, issuer: String) -> Result<T, Err
     let validation = jsonwebtoken::Validation {
         leeway: 30, // 30 seconds
         validate_exp: true,
-        validate_iat: false, // IssuedAt is the same as NotBefore
         validate_nbf: true,
         aud: None,
         iss: Some(issuer),
@@ -287,7 +286,7 @@ impl<'a, 'r> FromRequest<'a, 'r> for OrgHeaders {
                             device: headers.device,
                             user,
                             org_user_type: {
-                                if let Some(org_usr_type) = UserOrgType::from_i32(org_user.type_) {
+                                if let Some(org_usr_type) = UserOrgType::from_i32(org_user.atype) {
                                     org_usr_type
                                 } else {
                                     // This should only happen if the DB is corrupted

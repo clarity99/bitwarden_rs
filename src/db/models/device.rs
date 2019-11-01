@@ -2,7 +2,7 @@ use chrono::{NaiveDateTime, Utc};
 
 use super::User;
 
-#[derive(Debug, Identifiable, Queryable, Insertable, Associations)]
+#[derive(Debug, Identifiable, Queryable, Insertable, Associations, AsChangeset)]
 #[table_name = "devices"]
 #[belongs_to(User, foreign_key = "user_uuid")]
 #[primary_key(uuid)]
@@ -15,7 +15,7 @@ pub struct Device {
 
     pub name: String,
     /// https://github.com/bitwarden/core/tree/master/src/Core/Enums
-    pub type_: i32,
+    pub atype: i32,
     pub push_token: Option<String>,
 
     pub refresh_token: String,
@@ -25,7 +25,7 @@ pub struct Device {
 
 /// Local methods
 impl Device {
-    pub fn new(uuid: String, user_uuid: String, name: String, type_: i32) -> Self {
+    pub fn new(uuid: String, user_uuid: String, name: String, atype: i32) -> Self {
         let now = Utc::now().naive_utc();
 
         Self {
@@ -35,7 +35,7 @@ impl Device {
 
             user_uuid,
             name,
-            type_,
+            atype,
 
             push_token: None,
             refresh_token: String::new(),
@@ -70,10 +70,10 @@ impl Device {
         let time_now = Utc::now().naive_utc();
         self.updated_at = time_now;
 
-        let orgowner: Vec<_> = orgs.iter().filter(|o| o.type_ == 0).map(|o| o.org_uuid.clone()).collect();
-        let orgadmin: Vec<_> = orgs.iter().filter(|o| o.type_ == 1).map(|o| o.org_uuid.clone()).collect();
-        let orguser: Vec<_> = orgs.iter().filter(|o| o.type_ == 2).map(|o| o.org_uuid.clone()).collect();
-        let orgmanager: Vec<_> = orgs.iter().filter(|o| o.type_ == 3).map(|o| o.org_uuid.clone()).collect();
+        let orgowner: Vec<_> = orgs.iter().filter(|o| o.atype == 0).map(|o| o.org_uuid.clone()).collect();
+        let orgadmin: Vec<_> = orgs.iter().filter(|o| o.atype == 1).map(|o| o.org_uuid.clone()).collect();
+        let orguser: Vec<_> = orgs.iter().filter(|o| o.atype == 2).map(|o| o.org_uuid.clone()).collect();
+        let orgmanager: Vec<_> = orgs.iter().filter(|o| o.atype == 3).map(|o| o.org_uuid.clone()).collect();
 
 
         // Create the JWT claims struct, to send to the client
@@ -114,6 +114,18 @@ use crate::error::MapResult;
 
 /// Database methods
 impl Device {
+    #[cfg(feature = "postgresql")]
+    pub fn save(&mut self, conn: &DbConn) -> EmptyResult {
+        self.updated_at = Utc::now().naive_utc();
+
+        crate::util::retry(
+            || diesel::insert_into(devices::table).values(&*self).on_conflict(devices::uuid).do_update().set(&*self).execute(&**conn),
+            10,
+        )
+            .map_res("Error saving device")
+    }
+
+    #[cfg(not(feature = "postgresql"))]
     pub fn save(&mut self, conn: &DbConn) -> EmptyResult {
         self.updated_at = Utc::now().naive_utc();
 

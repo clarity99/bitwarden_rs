@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::process::Command;
 
 use rocket::http::{Cookie, Cookies, SameSite};
 use rocket::request::{self, FlashMessage, Form, FromRequest, Request};
@@ -9,7 +10,7 @@ use rocket_contrib::json::Json;
 use crate::api::{ApiResult, EmptyResult, JsonResult};
 use crate::auth::{decode_admin, encode_jwt, generate_admin_claims, ClientIp};
 use crate::config::ConfigBuilder;
-use crate::db::{models::*, DbConn};
+use crate::db::{backup_database, models::*, DbConn};
 use crate::error::Error;
 use crate::mail;
 use crate::CONFIG;
@@ -27,10 +28,16 @@ pub fn routes() -> Vec<Route> {
         invite_user,
         delete_user,
         deauth_user,
+        remove_2fa,
         update_revision_users,
         post_config,
         delete_config,
+        backup_db,
     ]
+}
+
+lazy_static! {
+    static ref CAN_BACKUP: bool = cfg!(feature = "sqlite") && Command::new("sqlite3").arg("-version").status().is_ok();
 }
 
 #[get("/")]
@@ -101,6 +108,7 @@ struct AdminTemplateData {
     version: Option<&'static str>,
     users: Vec<Value>,
     config: Value,
+    can_backup: bool,
 }
 
 impl AdminTemplateData {
@@ -110,6 +118,7 @@ impl AdminTemplateData {
             version: VERSION,
             users,
             config: CONFIG.prepare_json(),
+            can_backup: *CAN_BACKUP,
         }
     }
 
@@ -188,6 +197,18 @@ fn deauth_user(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
     user.save(&conn)
 }
 
+#[post("/users/<uuid>/remove-2fa")]
+fn remove_2fa(uuid: String, _token: AdminToken, conn: DbConn) -> EmptyResult {
+    let mut user = match User::find_by_uuid(&uuid, &conn) {
+        Some(user) => user,
+        None => err!("User doesn't exist"),
+    };
+
+    TwoFactor::delete_all_by_user(&user.uuid, &conn)?;
+    user.totp_recover = None;
+    user.save(&conn)
+}
+
 #[post("/users/update_revision")]
 fn update_revision_users(_token: AdminToken, conn: DbConn) -> EmptyResult {
     User::update_all_revisions(&conn)
@@ -202,6 +223,15 @@ fn post_config(data: Json<ConfigBuilder>, _token: AdminToken) -> EmptyResult {
 #[post("/config/delete")]
 fn delete_config(_token: AdminToken) -> EmptyResult {
     CONFIG.delete_user_config()
+}
+
+#[post("/config/backup_db")]
+fn backup_db(_token: AdminToken) -> EmptyResult {
+    if *CAN_BACKUP {
+        backup_database()
+    } else {
+        err!("Can't back up current DB (either it's not SQLite or the 'sqlite' binary is not present)");
+    }
 }
 
 pub struct AdminToken {}

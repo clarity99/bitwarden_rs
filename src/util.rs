@@ -4,6 +4,8 @@
 use rocket::fairing::{Fairing, Info, Kind};
 use rocket::response::{self, Responder};
 use rocket::{Request, Response};
+use rocket::http::{Header, HeaderMap, ContentType, Method, Status};
+use std::io::Cursor;
 
 pub struct AppHeaders();
 
@@ -27,6 +29,54 @@ impl Fairing for AppHeaders {
         // Disable cache unless otherwise specified
         if !res.headers().contains("cache-control") {
             res.set_raw_header("Cache-Control", "no-cache, no-store, max-age=0");
+        }
+    }
+}
+
+pub struct CORS();
+
+impl CORS {
+    fn get_header(headers: &HeaderMap, name: &str) -> String {
+        match headers.get_one(name) {
+            Some(h) => h.to_string(),
+            _ => "".to_string(),
+        }
+    }
+
+    fn valid_url(url: String) -> String {
+        match url.as_ref() {
+            "file://" => "*".to_string(),
+            _ => url,
+        }
+    }
+}
+
+impl Fairing for CORS {
+    fn info(&self) -> Info {
+        Info {
+            name: "CORS",
+            kind: Kind::Response
+        }
+    }
+
+    fn on_response(&self, request: &Request, response: &mut Response) {
+        let req_headers = request.headers();
+
+        // We need to explicitly get the Origin header for Access-Control-Allow-Origin
+        let req_allow_origin = CORS::valid_url(CORS::get_header(&req_headers, "Origin"));
+
+        response.set_header(Header::new("Access-Control-Allow-Origin", req_allow_origin));
+
+        if request.method() == Method::Options {
+            let req_allow_headers = CORS::get_header(&req_headers, "Access-Control-Request-Headers");
+            let req_allow_method = CORS::get_header(&req_headers,"Access-Control-Request-Method");
+
+            response.set_header(Header::new("Access-Control-Allow-Methods", req_allow_method));
+            response.set_header(Header::new("Access-Control-Allow-Headers", req_allow_headers));
+            response.set_header(Header::new("Access-Control-Allow-Credentials", "true"));
+            response.set_status(Status::Ok);
+            response.set_header(ContentType::Plain);
+            response.set_sized_body(Cursor::new(""));
         }
     }
 }

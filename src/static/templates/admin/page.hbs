@@ -26,9 +26,13 @@
                                 {{/each}}
                             </span>
                         </div>
-                        <div style="flex: 0 0 240px;">
-                            <a class="mr-3" href="#" onclick='deauthUser({{jsesc Id}})'>Deauthorize sessions</a>
-                            <a class="mr-3" href="#" onclick='deleteUser({{jsesc Id}}, {{jsesc Email}})'>Delete User</a>
+                        <div style="flex: 0 0 300px; font-size: 90%; text-align: right; padding-right: 15px">
+                            {{#if TwoFactorEnabled}}
+                            <a class="mr-2" href="#" onclick='remove2fa({{jsesc Id}})'>Remove all 2FA</a>
+                            {{/if}}
+
+                            <a class="mr-2" href="#" onclick='deauthUser({{jsesc Id}})'>Deauthorize sessions</a>
+                            <a class="mr-2" href="#" onclick='deleteUser({{jsesc Id}}, {{jsesc Email}})'>Delete User</a>
                         </div>
                     </div>
                 </div>
@@ -52,7 +56,7 @@
             <h6 class="mb-0 text-white">Invite User</h6>
             <small>Email:</small>
 
-            <form class="form-inline" id="invite-form">
+            <form class="form-inline" id="invite-form" onsubmit="inviteUser(); return false;">
                 <input type="email" class="form-control w-50 mr-2" id="email-invite" placeholder="Enter email">
                 <button type="submit" class="btn btn-primary">Invite</button>
             </form>
@@ -67,7 +71,7 @@
                 them to avoid confusion. This does not apply to the read-only section, which can only be set through the
                 environment.
             </div>
-            <form class="form accordion" id="config-form">
+            <form class="form accordion" id="config-form" onsubmit="saveConfig(); return false;">
                 {{#each config}}
                 {{#if groupdoc}}
                 <div class="card bg-light mb-3">
@@ -87,7 +91,7 @@
                                 {{#case type "password"}}
                                 <div class="input-group-append">
                                     <button class="btn btn-outline-secondary" type="button"
-                                        onclick="toggleVis('#input_{{name}}');">Show/hide</button>
+                                        onclick="toggleVis('input_{{name}}');">Show/hide</button>
                                 </div>
                                 {{/case}}
                             </div>
@@ -134,7 +138,7 @@
                                 {{#case type "password"}}
                                 <div class="input-group-append">
                                     <button class="btn btn-outline-secondary" type="button"
-                                        onclick="toggleVis('#input_{{name}}');">Show/hide</button>
+                                        onclick="toggleVis('input_{{name}}');">Show/hide</button>
                                 </div>
                                 {{/case}}
                             </div>
@@ -154,8 +158,22 @@
                         {{/unless}}
                         {{/each}}
                         {{/each}}
+
                     </div>
                 </div>
+
+                {{#if can_backup}}
+                <div class="card bg-light mb-3">
+                    <div class="card-header"><button type="button" class="btn btn-link collapsed" data-toggle="collapse"
+                            data-target="#g_database">Backup Database</button></div>
+                    <div id="g_database" class="card-body collapse" data-parent="#config-form">
+                        <div class="small mb-3">
+                            NOTE: A local installation of sqlite3 is required for this section to work.
+                        </div>
+                        <button type="button" class="btn btn-primary" onclick="backupDatabase();">Backup Database</button>
+                    </div>
+                </div>
+                {{/if}}
 
                 <button type="submit" class="btn btn-primary">Save</button>
                 <button type="button" class="btn btn-danger float-right" onclick="deleteConf();">Reset defaults</button>
@@ -173,35 +191,38 @@
 
 <script>
     function reload() { window.location.reload(); }
+    function msg(text) { alert(text); reload(); }
     function identicon(email) {
         const data = new Identicon(md5(email), { size: 48, format: 'svg' });
         return "data:image/svg+xml;base64," + data.toString();
     }
     function toggleVis(input_id) {
-        var type = $(input_id).attr("type");
+        const elem = document.getElementById(input_id);
+        const type = elem.getAttribute("type");
         if (type === "text") {
-            $(input_id).attr("type", "password");
+            elem.setAttribute("type", "password");
         } else {
-            $(input_id).attr("type", "text");
+            elem.setAttribute("type", "text");
         }
         return false;
     }
-    function _post(url, successMsg, errMsg, data) {
-        $.post({
-            url: url,
-            data: data,
-            //async: false,
-            contentType: "application/json",
-        }).done(function () {
-            alert(successMsg);
-        }).fail(function (e) {
-            const r = e.responseJSON;
-            const msg = r ? r.ErrorModel.Message : "Unknown error";
-            alert(errMsg + ": " + msg);
-        }).always(reload);
+    function _post(url, successMsg, errMsg, body) {
+        fetch(url, {
+            method: 'POST',
+            body: body,
+            mode: "same-origin",
+            credentials: "same-origin",
+            headers: { "Content-Type": "application/json" }
+        }).then(e => {
+            if (e.ok) { return msg(successMsg); }
+            e.json().then(json => {
+                const msg = json ? json.ErrorModel.Message : "Unknown error";
+                msg(errMsg + ": " + msg);
+            });
+        }).catch(e => { msg(errMsg + ": Unknown error") });
     }
     function deleteUser(id, mail) {
-        var input_mail = prompt("To delete user '" + mail + "', please type the name below")
+        var input_mail = prompt("To delete user '" + mail + "', please type the email below")
         if (input_mail != null) {
             if (input_mail == mail) {
                 _post("/admin/users/" + id + "/delete",
@@ -211,6 +232,12 @@
                 alert("Wrong email, please try again")
             }
         }
+        return false;
+    }
+    function remove2fa(id) {
+        _post("/admin/users/" + id + "/remove-2fa",
+            "2FA removed correctly",
+            "Error removing 2FA");
         return false;
     }
     function deauthUser(id) {
@@ -226,9 +253,9 @@
         return false;
     }
     function inviteUser() {
-        inv = $("#email-invite");
-        data = JSON.stringify({ "email": inv.val() });
-        inv.val("");
+        inv = document.getElementById("email-invite");
+        data = JSON.stringify({ "email": inv.value });
+        inv.value = "";
         _post("/admin/invite/", "User invited correctly",
             "Error inviting user", data);
         return false;
@@ -236,15 +263,15 @@
     function getFormData() {
         let data = {};
 
-        $(".conf-checkbox").each(function (i, e) {
-            data[e.name] = $(e).is(":checked");
+        document.querySelectorAll(".conf-checkbox").forEach(function (e, i) {
+            data[e.name] = e.checked;
         });
 
-        $(".conf-number").each(function (i, e) {
-            data[e.name] = +e.value;
+        document.querySelectorAll(".conf-number").forEach(function (e, i) {
+            data[e.name] = e.value ? +e.value : null;
         });
 
-        $(".conf-text, .conf-password").each(function (i, e) {
+        document.querySelectorAll(".conf-text, .conf-password").forEach(function (e, i) {
             data[e.name] = e.value || null;
         });
         return data;
@@ -268,20 +295,24 @@
 
         return false;
     }
+    function backupDatabase() {
+        _post("/admin/config/backup_db",
+            "Backup created successfully",
+            "Error creating backup");
+        return false;
+    }
     function masterCheck(check_id, inputs_query) {
-        function toggleEnabled(check_id, inputs_query, enabled) {
-            $(inputs_query).prop("disabled", !enabled)
-            if (!enabled)
-                $(inputs_query).val("");
-            $(check_id).prop("disabled", false);
-        };
-        function onChanged(check_id, inputs_query) {
-            return function _fn() { toggleEnabled(check_id, inputs_query, this.checked); };
+        function onChanged(checkbox, inputs_query) {
+            return function _fn() {
+                document.querySelectorAll(inputs_query).forEach(function (e, i) { e.disabled = !checkbox.checked; });
+                checkbox.disabled = false;
+            };
         };
 
-        toggleEnabled(check_id, inputs_query, $(check_id).is(":checked"));
-        $(check_id).change(onChanged(check_id, inputs_query));
-
+        const checkbox = document.getElementById(check_id);
+        const onChange = onChanged(checkbox, inputs_query);
+        onChange(); // Trigger the event initially
+        checkbox.addEventListener("change", onChange);
     }
     let OrgTypes = {
         "0": { "name": "Owner", "color": "orange" },
@@ -289,22 +320,20 @@
         "2": { "name": "User", "color": "blue" },
         "3": { "name": "Manager", "color": "green" },
     };
-    $(window).on('load', function () {
-        $("#invite-form").submit(inviteUser);
-        $("#config-form").submit(saveConfig);
-        $("img.identicon").each(function (i, e) {
-            e.src = identicon(e.dataset.src);
-        });
-        $('[data-orgtype]').each(function (i, e) {
-            let orgtype = OrgTypes[e.dataset.orgtype];
-            e.style.backgroundColor = orgtype.color;
-            e.title = orgtype.name;
-        });
 
-        // These are formatted because otherwise the 
-        // VSCode formatter breaks But they still work
-        // {{#each config}} {{#if grouptoggle}}
-        masterCheck("#input_{{grouptoggle}}", "#g_{{group}} input");
-        // {{/if}} {{/each}}       
+    document.querySelectorAll("img.identicon").forEach(function (e, i) {
+        e.src = identicon(e.dataset.src);
     });
+
+    document.querySelectorAll("[data-orgtype]").forEach(function (e, i) {
+        let orgtype = OrgTypes[e.dataset.orgtype];
+        e.style.backgroundColor = orgtype.color;
+        e.title = orgtype.name;
+    });
+
+    // These are formatted because otherwise the 
+    // VSCode formatter breaks But they still work
+    // {{#each config}} {{#if grouptoggle}}
+    masterCheck("input_{{grouptoggle}}", "#g_{{group}} input");
+    // {{/if}} {{/each}}
 </script>

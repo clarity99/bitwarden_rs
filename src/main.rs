@@ -1,6 +1,8 @@
-#![feature(proc_macro_hygiene, decl_macro, vec_remove_item, try_trait)]
+#![feature(proc_macro_hygiene, vec_remove_item, try_trait, ip)]
 #![recursion_limit = "256"]
 
+#[cfg(feature = "openssl")]
+extern crate openssl;
 #[macro_use]
 extern crate rocket;
 #[macro_use]
@@ -122,25 +124,28 @@ fn chain_syslog(logger: fern::Dispatch) -> fern::Dispatch {
 }
 
 fn check_db() {
-    let url = CONFIG.database_url();
-    let path = Path::new(&url);
+    if cfg!(feature = "sqlite") {
+        let url = CONFIG.database_url();
+        let path = Path::new(&url);
 
-    if let Some(parent) = path.parent() {
-        use std::fs;
-        if fs::create_dir_all(parent).is_err() {
-            error!("Error creating database directory");
-            exit(1);
+        if let Some(parent) = path.parent() {
+            use std::fs;
+            if fs::create_dir_all(parent).is_err() {
+                error!("Error creating database directory");
+                exit(1);
+            }
+        }
+
+        // Turn on WAL in SQLite
+        if CONFIG.enable_db_wal() {
+            use diesel::RunQueryDsl;
+            let connection = db::get_connection().expect("Can't conect to DB");
+            diesel::sql_query("PRAGMA journal_mode=wal")
+                .execute(&connection)
+                .expect("Failed to turn on WAL");
         }
     }
-
-    // Turn on WAL in SQLite
-    if CONFIG.enable_db_wal() {
-        use diesel::RunQueryDsl;
-        let connection = db::get_connection().expect("Can't conect to DB");
-        diesel::sql_query("PRAGMA journal_mode=wal")
-            .execute(&connection)
-            .expect("Failed to turn on WAL");
-    }
+    db::get_connection().expect("Can't connect to DB");
 }
 
 fn check_rsa_keys() {
@@ -207,7 +212,13 @@ fn check_web_vault() {
 // https://docs.rs/diesel_migrations/*/diesel_migrations/macro.embed_migrations.html
 #[allow(unused_imports)]
 mod migrations {
-    embed_migrations!();
+
+    #[cfg(feature = "sqlite")]
+    embed_migrations!("migrations/sqlite");
+    #[cfg(feature = "mysql")]
+    embed_migrations!("migrations/mysql");
+    #[cfg(feature = "postgresql")]
+    embed_migrations!("migrations/postgresql");
 
     pub fn run_migrations() {
         // Make sure the database is up to date (create if it doesn't exist, or run the migrations)
@@ -243,7 +254,8 @@ fn launch_rocket() {
     let rocket = rocket
         .manage(db::init_pool())
         .manage(api::start_notification_server())
-        .attach(util::AppHeaders());
+        .attach(util::AppHeaders())
+        .attach(util::CORS());
 
     // Launch and print error if there is one
     // The launch will restore the original logging level

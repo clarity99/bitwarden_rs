@@ -1,14 +1,17 @@
 use lettre::smtp::authentication::Credentials;
+use lettre::smtp::authentication::Mechanism as SmtpAuthMechanism;
 use lettre::smtp::ConnectionReuseParameters;
 use lettre::{ClientSecurity, ClientTlsParameters, SmtpClient, SmtpTransport, Transport};
 use lettre_email::{EmailBuilder, MimeMultipartType, PartBuilder};
 use native_tls::{Protocol, TlsConnector};
+use percent_encoding::{percent_encode, NON_ALPHANUMERIC};
 use quoted_printable::encode_to_str;
 
 use crate::api::EmptyResult;
 use crate::auth::{encode_jwt, generate_invite_claims};
 use crate::error::Error;
 use crate::CONFIG;
+use chrono::NaiveDateTime;
 
 fn mailer() -> SmtpTransport {
     let host = CONFIG.smtp_host().unwrap();
@@ -34,6 +37,17 @@ fn mailer() -> SmtpTransport {
 
     let smtp_client = match (&CONFIG.smtp_username(), &CONFIG.smtp_password()) {
         (Some(user), Some(pass)) => smtp_client.credentials(Credentials::new(user.clone(), pass.clone())),
+        _ => smtp_client,
+    };
+
+    let smtp_client = match &CONFIG.smtp_auth_mechanism() {
+        Some(auth_mechanism_json) => {
+            let auth_mechanism = serde_json::from_str::<SmtpAuthMechanism>(&auth_mechanism_json);
+            match auth_mechanism {
+                Ok(auth_mechanism) => smtp_client.authentication_mechanism(auth_mechanism),
+                _ => panic!("Failure to parse mechanism. Is it proper Json? Eg. `\"Plain\"` not `Plain`"),
+            }
+        }
         _ => smtp_client,
     };
 
@@ -101,7 +115,7 @@ pub fn send_invite(
             "url": CONFIG.domain(),
             "org_id": org_id.unwrap_or_else(|| "_".to_string()),
             "org_user_id": org_user_id.unwrap_or_else(|| "_".to_string()),
-            "email": address,
+            "email": percent_encode(address.as_bytes(), NON_ALPHANUMERIC).to_string(),
             "org_name": org_name,
             "token": invite_token,
         }),
@@ -129,6 +143,37 @@ pub fn send_invite_confirmed(address: &str, org_name: &str) -> EmptyResult {
         json!({
             "url": CONFIG.domain(),
             "org_name": org_name,
+        }),
+    )?;
+
+    send_email(&address, &subject, &body_html, &body_text)
+}
+
+pub fn send_new_device_logged_in(address: &str, ip: &str, dt: &NaiveDateTime, device: &str) -> EmptyResult {
+    use crate::util::upcase_first;
+    let device = upcase_first(device);
+
+    let datetime = dt.format("%A, %B %_d, %Y at %H:%M").to_string();
+
+    let (subject, body_html, body_text) = get_text(
+        "email/new_device_logged_in",
+        json!({
+            "url": CONFIG.domain(),
+            "ip": ip,
+            "device": device,
+            "datetime": datetime,
+        }),
+    )?;
+
+    send_email(&address, &subject, &body_html, &body_text)
+}
+
+pub fn send_token(address: &str, token: &str) -> EmptyResult {
+    let (subject, body_html, body_text) = get_text(
+        "email/twofactor_email",
+        json!({
+            "url": CONFIG.domain(),
+            "token": token,
         }),
     )?;
 

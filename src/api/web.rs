@@ -1,4 +1,3 @@
-use std::io;
 use std::path::{Path, PathBuf};
 
 use rocket::http::ContentType;
@@ -9,21 +8,22 @@ use rocket_contrib::json::Json;
 use serde_json::Value;
 
 use crate::util::Cached;
+use crate::error::Error;
 use crate::CONFIG;
 
 pub fn routes() -> Vec<Route> {
     if CONFIG.web_vault_enabled() {
-        routes![web_index, app_id, web_files, attachments, alive]
+        routes![web_index, app_id, web_files, attachments, alive, static_files]
     } else {
-        routes![attachments, alive]
+        routes![attachments, alive, static_files]
     }
 }
 
 #[get("/")]
-fn web_index() -> Cached<io::Result<NamedFile>> {
+fn web_index() -> Cached<Option<NamedFile>> {
     Cached::short(NamedFile::open(
         Path::new(&CONFIG.web_vault_folder()).join("index.html"),
-    ))
+    ).ok())
 }
 
 #[get("/app-id.json")]
@@ -46,13 +46,13 @@ fn app_id() -> Cached<Content<Json<Value>>> {
 }
 
 #[get("/<p..>", rank = 10)] // Only match this if the other routes don't match
-fn web_files(p: PathBuf) -> Cached<io::Result<NamedFile>> {
-    Cached::long(NamedFile::open(Path::new(&CONFIG.web_vault_folder()).join(p)))
+fn web_files(p: PathBuf) -> Cached<Option<NamedFile>> {
+    Cached::long(NamedFile::open(Path::new(&CONFIG.web_vault_folder()).join(p)).ok())
 }
 
 #[get("/attachments/<uuid>/<file..>")]
-fn attachments(uuid: String, file: PathBuf) -> io::Result<NamedFile> {
-    NamedFile::open(Path::new(&CONFIG.attachments_folder()).join(uuid).join(file))
+fn attachments(uuid: String, file: PathBuf) -> Option<NamedFile> {
+    NamedFile::open(Path::new(&CONFIG.attachments_folder()).join(uuid).join(file)).ok()
 }
 
 #[get("/alive")]
@@ -61,4 +61,20 @@ fn alive() -> Json<String> {
     use chrono::Utc;
 
     Json(format_date(&Utc::now().naive_utc()))
+}
+
+#[get("/bwrs_static/<filename>")]
+fn static_files(filename: String) -> Result<Content<&'static [u8]>, Error> {
+    match filename.as_ref() {
+        "mail-github.png" => Ok(Content(ContentType::PNG, include_bytes!("../static/images/mail-github.png"))),
+        "logo-gray.png" => Ok(Content(ContentType::PNG, include_bytes!("../static/images/logo-gray.png"))),
+        "error-x.svg" => Ok(Content(ContentType::SVG, include_bytes!("../static/images/error-x.svg"))),
+        "hibp.png" => Ok(Content(ContentType::PNG, include_bytes!("../static/images/hibp.png"))),
+
+        "bootstrap.css" => Ok(Content(ContentType::CSS, include_bytes!("../static/scripts/bootstrap.css"))),
+        "bootstrap-native-v4.js" => Ok(Content(ContentType::JavaScript, include_bytes!("../static/scripts/bootstrap-native-v4.js"))),
+        "md5.js" => Ok(Content(ContentType::JavaScript, include_bytes!("../static/scripts/md5.js"))),
+        "identicon.js" => Ok(Content(ContentType::JavaScript, include_bytes!("../static/scripts/identicon.js"))),
+        _ => err!("Image not found"),
+    }
 }

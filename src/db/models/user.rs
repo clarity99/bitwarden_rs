@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::crypto;
 use crate::CONFIG;
 
-#[derive(Debug, Identifiable, Queryable, Insertable)]
+#[derive(Debug, Identifiable, Queryable, Insertable, AsChangeset)]
 #[table_name = "users"]
 #[primary_key(uuid)]
 pub struct User {
@@ -20,7 +20,7 @@ pub struct User {
     pub password_iterations: i32,
     pub password_hint: Option<String>,
 
-    pub key: String,
+    pub akey: String,
     pub private_key: Option<String>,
     pub public_key: Option<String>,
 
@@ -46,7 +46,7 @@ enum UserStatus {
 /// Local methods
 impl User {
     pub const CLIENT_KDF_TYPE_DEFAULT: i32 = 0; // PBKDF2: 0
-    pub const CLIENT_KDF_ITER_DEFAULT: i32 = 5_000;
+    pub const CLIENT_KDF_ITER_DEFAULT: i32 = 100_000;
 
     pub fn new(mail: String) -> Self {
         let now = Utc::now().naive_utc();
@@ -58,7 +58,7 @@ impl User {
             updated_at: now,
             name: email.clone(),
             email,
-            key: String::new(),
+            akey: String::new(),
 
             password_hash: Vec::new(),
             salt: crypto::get_random_64(),
@@ -140,7 +140,7 @@ impl User {
             "MasterPasswordHint": self.password_hint,
             "Culture": "en-US",
             "TwoFactorEnabled": twofactor_enabled,
-            "Key": self.key,
+            "Key": self.akey,
             "PrivateKey": self.private_key,
             "SecurityStamp": self.security_stamp,
             "Organizations": orgs_json,
@@ -148,6 +148,24 @@ impl User {
         })
     }
 
+    #[cfg(feature = "postgresql")]
+    pub fn save(&mut self, conn: &DbConn) -> EmptyResult {
+        if self.email.trim().is_empty() {
+            err!("User email can't be empty")
+        }
+
+        self.updated_at = Utc::now().naive_utc();
+
+        diesel::insert_into(users::table) // Insert or update
+            .values(&*self)
+            .on_conflict(users::uuid)
+            .do_update()
+            .set(&*self)
+            .execute(&**conn)
+            .map_res("Error saving user")
+    }
+
+    #[cfg(not(feature = "postgresql"))]
     pub fn save(&mut self, conn: &DbConn) -> EmptyResult {
         if self.email.trim().is_empty() {
             err!("User email can't be empty")
@@ -163,7 +181,7 @@ impl User {
 
     pub fn delete(self, conn: &DbConn) -> EmptyResult {
         for user_org in UserOrganization::find_by_user(&self.uuid, &*conn) {
-            if user_org.type_ == UserOrgType::Owner {
+            if user_org.atype == UserOrgType::Owner {
                 let owner_type = UserOrgType::Owner as i32;
                 if UserOrganization::find_by_org_and_type(&user_org.org_uuid, owner_type, &conn).len() <= 1 {
                     err!("Can't delete last owner")
@@ -250,6 +268,21 @@ impl Invitation {
         Self { email }
     }
 
+    #[cfg(feature = "postgresql")]
+    pub fn save(&self, conn: &DbConn) -> EmptyResult {
+        if self.email.trim().is_empty() {
+            err!("Invitation email can't be empty")
+        }
+
+        diesel::insert_into(invitations::table)
+            .values(self)
+            .on_conflict(invitations::email)
+            .do_nothing()
+            .execute(&**conn)
+            .map_res("Error saving invitation")
+    }
+
+    #[cfg(not(feature = "postgresql"))]
     pub fn save(&self, conn: &DbConn) -> EmptyResult {
         if self.email.trim().is_empty() {
             err!("Invitation email can't be empty")

@@ -1,20 +1,17 @@
+use num_traits::FromPrimitive;
 use rocket::request::{Form, FormItems, FromForm};
 use rocket::Route;
-
 use rocket_contrib::json::Json;
 use serde_json::Value;
 
-use num_traits::FromPrimitive;
-
+use crate::api::core::two_factor::email::EmailTokenData;
+use crate::api::core::two_factor::{duo, email, yubikey};
+use crate::api::{ApiResult, EmptyResult, JsonResult};
+use crate::auth::ClientIp;
 use crate::db::models::*;
 use crate::db::DbConn;
-
+use crate::mail;
 use crate::util;
-
-use crate::api::{ApiResult, EmptyResult, JsonResult};
-
-use crate::auth::ClientIp;
-
 use crate::CONFIG;
 
 pub fn routes() -> Vec<Route> {
@@ -68,7 +65,7 @@ fn _refresh_login(data: ConnectData, conn: DbConn) -> JsonResult {
         "expires_in": expires_in,
         "token_type": "Bearer",
         "refresh_token": device.refresh_token,
-        "Key": user.key,
+        "Key": user.akey,
         "PrivateKey": user.private_key,
     })))
 }
@@ -99,26 +96,19 @@ fn _password_login(data: ConnectData, conn: DbConn, ip: ClientIp) -> JsonResult 
         )
     }
 
-    // On iOS, device_type sends "iOS", on others it sends a number
-    let device_type = util::try_parse_string(data.device_type.as_ref()).unwrap_or(0);
-    let device_id = data.device_identifier.clone().expect("No device id provided");
-    let device_name = data.device_name.clone().expect("No device name provided");
-
-    // Find device or create new
-    let mut device = match Device::find_by_uuid(&device_id, &conn) {
-        Some(device) => {
-            // Check if owned device, and recreate if not
-            if device.user_uuid != user.uuid {
-                info!("Device exists but is owned by another user. The old device will be discarded");
-                Device::new(device_id, user.uuid.clone(), device_name, device_type)
-            } else {
-                device
-            }
-        }
-        None => Device::new(device_id, user.uuid.clone(), device_name, device_type),
-    };
+    let (mut device, new_device) = get_device(&data, &conn, &user);
 
     let twofactor_token = twofactor_auth(&user.uuid, &data, &mut device, &conn)?;
+
+    if CONFIG.mail_enabled() && new_device {
+        if let Err(e) = mail::send_new_device_logged_in(&user.email, &ip.ip.to_string(), &device.updated_at, &device.name) {
+            error!("Error sending new device email: {:#?}", e);
+
+            if CONFIG.require_device_email() {
+                err!("Could not send login notification email. Please contact your administrator.")
+            }
+        }
+    }
 
     // Common
     let user = User::find_by_uuid(&device.user_uuid, &conn).unwrap();
@@ -132,7 +122,7 @@ fn _password_login(data: ConnectData, conn: DbConn, ip: ClientIp) -> JsonResult 
         "expires_in": expires_in,
         "token_type": "Bearer",
         "refresh_token": device.refresh_token,
-        "Key": user.key,
+        "Key": user.akey,
         "PrivateKey": user.private_key,
         //"TwoFactorToken": "11122233333444555666777888999"
     });
@@ -143,6 +133,35 @@ fn _password_login(data: ConnectData, conn: DbConn, ip: ClientIp) -> JsonResult 
 
     info!("User {} logged in successfully. IP: {}", username, ip.ip);
     Ok(Json(result))
+}
+
+/// Retrieves an existing device or creates a new device from ConnectData and the User
+fn get_device(data: &ConnectData, conn: &DbConn, user: &User) -> (Device, bool) {
+    // On iOS, device_type sends "iOS", on others it sends a number
+    let device_type = util::try_parse_string(data.device_type.as_ref()).unwrap_or(0);
+    let device_id = data.device_identifier.clone().expect("No device id provided");
+    let device_name = data.device_name.clone().expect("No device name provided");
+
+    let mut new_device = false;
+    // Find device or create new
+    let device = match Device::find_by_uuid(&device_id, &conn) {
+        Some(device) => {
+            // Check if owned device, and recreate if not
+            if device.user_uuid != user.uuid {
+                info!("Device exists but is owned by another user. The old device will be discarded");
+                new_device = true;
+                Device::new(device_id, user.uuid.clone(), device_name, device_type)
+            } else {
+                device
+            }
+        }
+        None => {
+            new_device = true;
+            Device::new(device_id, user.uuid.clone(), device_name, device_type)
+        }
+    };
+
+    (device, new_device)
 }
 
 fn twofactor_auth(
@@ -158,7 +177,7 @@ fn twofactor_auth(
         return Ok(None);
     }
 
-    let twofactor_ids: Vec<_> = twofactors.iter().map(|tf| tf.type_).collect();
+    let twofactor_ids: Vec<_> = twofactors.iter().map(|tf| tf.atype).collect();
     let selected_id = data.two_factor_provider.unwrap_or(twofactor_ids[0]); // If we aren't given a two factor provider, asume the first one
 
     let twofactor_code = match data.two_factor_token {
@@ -166,7 +185,10 @@ fn twofactor_auth(
         None => err_json!(_json_err_twofactor(&twofactor_ids, user_uuid, conn)?),
     };
 
-    let selected_twofactor = twofactors.into_iter().filter(|tf| tf.type_ == selected_id).nth(0);
+    let selected_twofactor = twofactors
+        .into_iter()
+        .filter(|tf| tf.atype == selected_id && tf.enabled)
+        .nth(0);
 
     use crate::api::core::two_factor as _tf;
     use crate::crypto::ct_eq;
@@ -175,10 +197,11 @@ fn twofactor_auth(
     let mut remember = data.two_factor_remember.unwrap_or(0);
 
     match TwoFactorType::from_i32(selected_id) {
-        Some(TwoFactorType::Authenticator) => _tf::validate_totp_code_str(twofactor_code, &selected_data?)?,
-        Some(TwoFactorType::U2f) => _tf::validate_u2f_login(user_uuid, twofactor_code, conn)?,
-        Some(TwoFactorType::YubiKey) => _tf::validate_yubikey_login(twofactor_code, &selected_data?)?,
-        Some(TwoFactorType::Duo) => _tf::validate_duo_login(data.username.as_ref().unwrap(), twofactor_code, conn)?,
+        Some(TwoFactorType::Authenticator) => _tf::authenticator::validate_totp_code_str(user_uuid, twofactor_code, &selected_data?, conn)?,
+        Some(TwoFactorType::U2f) => _tf::u2f::validate_u2f_login(user_uuid, twofactor_code, conn)?,
+        Some(TwoFactorType::YubiKey) => _tf::yubikey::validate_yubikey_login(twofactor_code, &selected_data?)?,
+        Some(TwoFactorType::Duo) => _tf::duo::validate_duo_login(data.username.as_ref().unwrap(), twofactor_code, conn)?,
+        Some(TwoFactorType::Email) => _tf::email::validate_email_code_str(user_uuid, twofactor_code, &selected_data?, conn)?,
 
         Some(TwoFactorType::Remember) => {
             match device.twofactor_remember {
@@ -223,7 +246,7 @@ fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &DbConn) -> Api
             Some(TwoFactorType::Authenticator) => { /* Nothing to do for TOTP */ }
 
             Some(TwoFactorType::U2f) if CONFIG.domain_set() => {
-                let request = two_factor::generate_u2f_login(user_uuid, conn)?;
+                let request = two_factor::u2f::generate_u2f_login(user_uuid, conn)?;
                 let mut challenge_list = Vec::new();
 
                 for key in request.registered_keys {
@@ -248,7 +271,7 @@ fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &DbConn) -> Api
                     None => err!("User does not exist"),
                 };
 
-                let (signature, host) = two_factor::generate_duo_signature(&email, conn)?;
+                let (signature, host) = duo::generate_duo_signature(&email, conn)?;
 
                 result["TwoFactorProviders2"][provider.to_string()] = json!({
                     "Host": host,
@@ -262,10 +285,29 @@ fn _json_err_twofactor(providers: &[i32], user_uuid: &str, conn: &DbConn) -> Api
                     None => err!("No YubiKey devices registered"),
                 };
 
-                let yubikey_metadata: two_factor::YubikeyMetadata = serde_json::from_str(&twofactor.data)?;
+                let yubikey_metadata: yubikey::YubikeyMetadata = serde_json::from_str(&twofactor.data)?;
 
                 result["TwoFactorProviders2"][provider.to_string()] = json!({
                     "Nfc": yubikey_metadata.Nfc,
+                })
+            }
+
+            Some(tf_type @ TwoFactorType::Email) => {
+                use crate::api::core::two_factor as _tf;
+
+                let twofactor = match TwoFactor::find_by_user_and_type(user_uuid, tf_type as i32, &conn) {
+                    Some(tf) => tf,
+                    None => err!("No twofactor email registered"),
+                };
+
+                // Send email immediately if email is the only 2FA option
+                if providers.len() == 1 {
+                    _tf::email::send_token(&user_uuid, &conn)?
+                }
+
+                let email_data = EmailTokenData::from_json(&twofactor.data)?;
+                result["TwoFactorProviders2"][provider.to_string()] = json!({
+                    "Email": email::obscure_email(&email_data.email),
                 })
             }
 

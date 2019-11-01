@@ -3,7 +3,7 @@ use serde_json::Value;
 use super::Cipher;
 use crate::CONFIG;
 
-#[derive(Debug, Identifiable, Queryable, Insertable, Associations)]
+#[derive(Debug, Identifiable, Queryable, Insertable, Associations, AsChangeset)]
 #[table_name = "attachments"]
 #[belongs_to(Cipher, foreign_key = "cipher_uuid")]
 #[primary_key(id)]
@@ -12,7 +12,7 @@ pub struct Attachment {
     pub cipher_uuid: String,
     pub file_name: String,
     pub file_size: i32,
-    pub key: Option<String>,
+    pub akey: Option<String>,
 }
 
 /// Local methods
@@ -23,7 +23,7 @@ impl Attachment {
             cipher_uuid,
             file_name,
             file_size,
-            key: None,
+            akey: None,
         }
     }
 
@@ -43,7 +43,7 @@ impl Attachment {
             "FileName": self.file_name,
             "Size": self.file_size.to_string(),
             "SizeName": display_size,
-            "Key": self.key,
+            "Key": self.akey,
             "Object": "attachment"
         })
     }
@@ -59,6 +59,18 @@ use crate::error::MapResult;
 
 /// Database methods
 impl Attachment {
+    #[cfg(feature = "postgresql")]
+    pub fn save(&self, conn: &DbConn) -> EmptyResult {
+        diesel::insert_into(attachments::table)
+            .values(self)
+            .on_conflict(attachments::id)
+            .do_update()
+            .set(self)
+            .execute(&**conn)
+            .map_res("Error saving attachment")
+    }
+
+    #[cfg(not(feature = "postgresql"))]
     pub fn save(&self, conn: &DbConn) -> EmptyResult {
         diesel::replace_into(attachments::table)
             .values(self)

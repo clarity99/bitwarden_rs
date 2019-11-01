@@ -63,7 +63,7 @@ fn put_device_token(uuid: String, data: JsonUpcase<Value>, headers: Headers) -> 
     Ok(Json(json!({
         "Id": headers.device.uuid,
         "Name": headers.device.name,
-        "Type": headers.device.type_,
+        "Type": headers.device.atype,
         "Identifier": headers.device.uuid,
         "CreationDate": crate::util::format_date(&headers.device.created_at),
     })))
@@ -132,18 +132,44 @@ fn put_eq_domains(data: JsonUpcase<EquivDomainData>, headers: Headers, conn: DbC
 
 #[get("/hibp/breach?<username>")]
 fn hibp_breach(username: String) -> JsonResult {
-    let url = format!("https://haveibeenpwned.com/api/v2/breachedaccount/{}", username);
     let user_agent = "Bitwarden_RS";
+    let url = format!(
+        "https://haveibeenpwned.com/api/v3/breachedaccount/{}?truncateResponse=false&includeUnverified=false",
+        username
+    );
 
     use reqwest::{header::USER_AGENT, Client};
 
-    let res = Client::new().get(&url).header(USER_AGENT, user_agent).send()?;
+    if let Some(api_key) = crate::CONFIG.hibp_api_key() {
+        let hibp_client = Client::builder()
+            .use_sys_proxy()
+            .build()?;
 
-    // If we get a 404, return a 404, it means no breached accounts
-    if res.status() == 404 {
-        return Err(Error::empty().with_code(404));
+        let res = hibp_client.get(&url)
+            .header(USER_AGENT, user_agent)
+            .header("hibp-api-key", api_key)
+            .send()?;
+
+        // If we get a 404, return a 404, it means no breached accounts
+        if res.status() == 404 {
+            return Err(Error::empty().with_code(404));
+        }
+
+        let value: Value = res.error_for_status()?.json()?;
+        Ok(Json(value))
+    } else {
+        Ok(Json(json!([{
+            "Name": "HaveIBeenPwned",
+            "Title": "Manual HIBP Check",
+            "Domain": "haveibeenpwned.com",
+            "BreachDate": "2019-08-18T00:00:00Z",
+            "AddedDate": "2019-08-18T00:00:00Z",
+            "Description": format!("Go to: <a href=\"https://haveibeenpwned.com/account/{account}\" target=\"_blank\" rel=\"noopener\">https://haveibeenpwned.com/account/{account}</a> for a manual check.<br/><br/>HaveIBeenPwned API key not set!<br/>Go to <a href=\"https://haveibeenpwned.com/API/Key\" target=\"_blank\" rel=\"noopener\">https://haveibeenpwned.com/API/Key</a> to purchase an API key from HaveIBeenPwned.<br/><br/>", account=username),
+            "LogoPath": "/bwrs_static/hibp.png",
+            "PwnCount": 0,
+            "DataClasses": [
+                "Error - No API key set!"
+            ]
+        }])))
     }
-
-    let value: Value = res.error_for_status()?.json()?;
-    Ok(Json(value))
 }
