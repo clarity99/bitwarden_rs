@@ -2,14 +2,19 @@ use data_encoding::BASE32;
 use rocket::Route;
 use rocket_contrib::json::Json;
 
-use crate::api::core::two_factor::_generate_recover_code;
-use crate::api::{EmptyResult, JsonResult, JsonUpcase, NumberOrString, PasswordData};
-use crate::auth::Headers;
-use crate::crypto;
-use crate::db::{
-    models::{TwoFactor, TwoFactorType},
-    DbConn,
+use crate::{
+    api::{
+        core::two_factor::_generate_recover_code, EmptyResult, JsonResult, JsonUpcase, NumberOrString, PasswordData,
+    },
+    auth::{ClientIp, Headers},
+    crypto,
+    db::{
+        models::{TwoFactor, TwoFactorType},
+        DbConn,
+    },
 };
+
+pub use crate::config::CONFIG;
 
 pub fn routes() -> Vec<Route> {
     routes![
@@ -18,6 +23,7 @@ pub fn routes() -> Vec<Route> {
         activate_authenticator_put,
     ]
 }
+
 #[post("/two-factor/get-authenticator", data = "<data>")]
 fn generate_authenticator(data: JsonUpcase<PasswordData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: PasswordData = data.into_inner().data;
@@ -51,7 +57,12 @@ struct EnableAuthenticatorData {
 }
 
 #[post("/two-factor/authenticator", data = "<data>")]
-fn activate_authenticator(data: JsonUpcase<EnableAuthenticatorData>, headers: Headers, conn: DbConn) -> JsonResult {
+fn activate_authenticator(
+    data: JsonUpcase<EnableAuthenticatorData>,
+    headers: Headers,
+    ip: ClientIp,
+    conn: DbConn,
+) -> JsonResult {
     let data: EnableAuthenticatorData = data.into_inner().data;
     let password_hash = data.MasterPasswordHash;
     let key = data.Key;
@@ -74,7 +85,7 @@ fn activate_authenticator(data: JsonUpcase<EnableAuthenticatorData>, headers: He
     }
 
     // Validate the token provided with the key, and save new twofactor
-    validate_totp_code(&user.uuid, token, &key.to_uppercase(), &conn)?;
+    validate_totp_code(&user.uuid, token, &key.to_uppercase(), &ip, &conn)?;
 
     _generate_recover_code(&mut user, &conn);
 
@@ -86,22 +97,32 @@ fn activate_authenticator(data: JsonUpcase<EnableAuthenticatorData>, headers: He
 }
 
 #[put("/two-factor/authenticator", data = "<data>")]
-fn activate_authenticator_put(data: JsonUpcase<EnableAuthenticatorData>, headers: Headers, conn: DbConn) -> JsonResult {
-    activate_authenticator(data, headers, conn)
+fn activate_authenticator_put(
+    data: JsonUpcase<EnableAuthenticatorData>,
+    headers: Headers,
+    ip: ClientIp,
+    conn: DbConn,
+) -> JsonResult {
+    activate_authenticator(data, headers, ip, conn)
 }
 
-pub fn validate_totp_code_str(user_uuid: &str, totp_code: &str, secret: &str, conn: &DbConn) -> EmptyResult {
+pub fn validate_totp_code_str(
+    user_uuid: &str,
+    totp_code: &str,
+    secret: &str,
+    ip: &ClientIp,
+    conn: &DbConn,
+) -> EmptyResult {
     let totp_code: u64 = match totp_code.parse() {
         Ok(code) => code,
         _ => err!("TOTP code is not a number"),
     };
 
-    validate_totp_code(user_uuid, totp_code, secret, &conn)
+    validate_totp_code(user_uuid, totp_code, secret, ip, &conn)
 }
 
-pub fn validate_totp_code(user_uuid: &str, totp_code: u64, secret: &str, conn: &DbConn) -> EmptyResult {
+pub fn validate_totp_code(user_uuid: &str, totp_code: u64, secret: &str, ip: &ClientIp, conn: &DbConn) -> EmptyResult {
     use oath::{totp_raw_custom_time, HashType};
-    use std::time::{UNIX_EPOCH, SystemTime};
 
     let decoded_secret = match BASE32.decode(secret.as_bytes()) {
         Ok(s) => s,
@@ -114,22 +135,23 @@ pub fn validate_totp_code(user_uuid: &str, totp_code: u64, secret: &str, conn: &
     };
 
     // Get the current system time in UNIX Epoch (UTC)
-    let current_time: u64 = SystemTime::now().duration_since(UNIX_EPOCH)
-        .expect("Earlier than 1970-01-01 00:00:00 UTC").as_secs();
+    let current_time = chrono::Utc::now();
+    let current_timestamp = current_time.timestamp();
 
     // The amount of steps back and forward in time
-    let steps = 1;
-    for step in -steps..=steps {
+    // Also check if we need to disable time drifted TOTP codes.
+    // If that is the case, we set the steps to 0 so only the current TOTP is valid.
+    let steps: i64 = if CONFIG.authenticator_disable_time_drift() { 0 } else { 1 };
 
-        let time_step = (current_time / 30) as i32 + step;
+    for step in -steps..=steps {
+        let time_step = current_timestamp / 30i64 + step;
         // We need to calculate the time offsite and cast it as an i128.
         // Else we can't do math with it on a default u64 variable.
-        let time_offset: i128 = (step * 30).into();
-        let generated = totp_raw_custom_time(&decoded_secret, 6, 0, 30, (current_time as i128 + time_offset) as u64, &HashType::SHA1);
+        let time = (current_timestamp + step * 30i64) as u64;
+        let generated = totp_raw_custom_time(&decoded_secret, 6, 0, 30, time, &HashType::SHA1);
 
         // Check the the given code equals the generated and if the time_step is larger then the one last used.
-        if generated == totp_code && time_step > twofactor.last_used {
-
+        if generated == totp_code && time_step > twofactor.last_used as i64 {
             // If the step does not equals 0 the time is drifted either server or client side.
             if step != 0 {
                 info!("TOTP Time drift detected. The step offset is {}", step);
@@ -137,15 +159,26 @@ pub fn validate_totp_code(user_uuid: &str, totp_code: u64, secret: &str, conn: &
 
             // Save the last used time step so only totp time steps higher then this one are allowed.
             // This will also save a newly created twofactor if the code is correct.
-            twofactor.last_used = time_step;
+            twofactor.last_used = time_step as i32;
             twofactor.save(&conn)?;
             return Ok(());
-        } else if generated == totp_code && time_step <= twofactor.last_used {
-            warn!("This or a TOTP code within {} steps back and forward has already been used!", steps);
-            err!("Invalid TOTP Code!");
+        } else if generated == totp_code && time_step <= twofactor.last_used as i64 {
+            warn!(
+                "This or a TOTP code within {} steps back and forward has already been used!",
+                steps
+            );
+            err!(format!(
+                "Invalid TOTP code! Server time: {} IP: {}",
+                current_time.format("%F %T UTC"),
+                ip.ip
+            ));
         }
     }
 
     // Else no valide code received, deny access
-    err!("Invalid TOTP code!");
+    err!(format!(
+        "Invalid TOTP code! Server time: {} IP: {}",
+        current_time.format("%F %T UTC"),
+        ip.ip
+    ));
 }

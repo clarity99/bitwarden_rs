@@ -20,8 +20,8 @@ table! {
         notes -> Nullable<Text>,
         fields -> Nullable<Text>,
         data -> Text,
-        favorite -> Bool,
         password_history -> Nullable<Text>,
+        deleted_at -> Nullable<Timestamp>,
     }
 }
 
@@ -55,6 +55,13 @@ table! {
 }
 
 table! {
+    favorites (user_uuid, cipher_uuid) {
+        user_uuid -> Text,
+        cipher_uuid -> Text,
+    }
+}
+
+table! {
     folders (uuid) {
         uuid -> Text,
         created_at -> Timestamp,
@@ -74,6 +81,16 @@ table! {
 table! {
     invitations (email) {
         email -> Text,
+    }
+}
+
+table! {
+    org_policies (uuid) {
+        uuid -> Text,
+        org_uuid -> Text,
+        atype -> Integer,
+        enabled -> Bool,
+        data -> Text,
     }
 }
 
@@ -99,9 +116,15 @@ table! {
 table! {
     users (uuid) {
         uuid -> Text,
+        enabled -> Bool,
         created_at -> Timestamp,
         updated_at -> Timestamp,
+        verified_at -> Nullable<Timestamp>,
+        last_verifying_at -> Nullable<Timestamp>,
+        login_verify_count -> Integer,
         email -> Text,
+        email_new -> Nullable<Text>,
+        email_new_token -> Nullable<Text>,
         name -> Text,
         password_hash -> Binary,
         salt -> Binary,
@@ -113,6 +136,7 @@ table! {
         totp_secret -> Nullable<Text>,
         totp_recover -> Nullable<Text>,
         security_stamp -> Text,
+        stamp_exception -> Nullable<Text>,
         equivalent_domains -> Text,
         excluded_globals -> Text,
         client_kdf_type -> Integer,
@@ -125,6 +149,7 @@ table! {
         user_uuid -> Text,
         collection_uuid -> Text,
         read_only -> Bool,
+        hide_passwords -> Bool,
     }
 }
 
@@ -150,6 +175,7 @@ joinable!(devices -> users (user_uuid));
 joinable!(folders -> users (user_uuid));
 joinable!(folders_ciphers -> ciphers (cipher_uuid));
 joinable!(folders_ciphers -> folders (folder_uuid));
+joinable!(org_policies -> organizations (org_uuid));
 joinable!(twofactor -> users (user_uuid));
 joinable!(users_collections -> collections (collection_uuid));
 joinable!(users_collections -> users (user_uuid));
@@ -165,6 +191,7 @@ allow_tables_to_appear_in_same_query!(
     folders,
     folders_ciphers,
     invitations,
+    org_policies,
     organizations,
     twofactor,
     users,

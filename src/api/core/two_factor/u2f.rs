@@ -1,27 +1,31 @@
+use once_cell::sync::Lazy;
 use rocket::Route;
 use rocket_contrib::json::Json;
-use serde_json;
 use serde_json::Value;
-use u2f::messages::{RegisterResponse, SignResponse, U2fSignRequest};
-use u2f::protocol::{Challenge, U2f};
-use u2f::register::Registration;
-
-use crate::api::core::two_factor::_generate_recover_code;
-use crate::api::{ApiResult, EmptyResult, JsonResult, JsonUpcase, NumberOrString, PasswordData};
-use crate::auth::Headers;
-use crate::db::{
-    models::{TwoFactor, TwoFactorType},
-    DbConn,
+use u2f::{
+    messages::{RegisterResponse, SignResponse, U2fSignRequest},
+    protocol::{Challenge, U2f},
+    register::Registration,
 };
-use crate::error::Error;
-use crate::CONFIG;
+
+use crate::{
+    api::{
+        core::two_factor::_generate_recover_code, ApiResult, EmptyResult, JsonResult, JsonUpcase, NumberOrString,
+        PasswordData,
+    },
+    auth::Headers,
+    db::{
+        models::{TwoFactor, TwoFactorType},
+        DbConn,
+    },
+    error::Error,
+    CONFIG,
+};
 
 const U2F_VERSION: &str = "U2F_V2";
 
-lazy_static! {
-    static ref APP_ID: String = format!("{}/app-id.json", &CONFIG.domain());
-    static ref U2F: U2f = U2f::new(APP_ID.clone());
-}
+static APP_ID: Lazy<String> = Lazy::new(|| format!("{}/app-id.json", &CONFIG.domain()));
+static U2F: Lazy<U2f> = Lazy::new(|| U2f::new(APP_ID.clone()));
 
 pub fn routes() -> Vec<Route> {
     routes![
@@ -29,6 +33,7 @@ pub fn routes() -> Vec<Route> {
         generate_u2f_challenge,
         activate_u2f,
         activate_u2f_put,
+        delete_u2f,
     ]
 }
 
@@ -91,6 +96,7 @@ struct RegistrationDef {
     key_handle: Vec<u8>,
     pub_key: Vec<u8>,
     attestation_cert: Option<Vec<u8>>,
+    device_name: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -164,7 +170,7 @@ fn activate_u2f(data: JsonUpcase<EnableU2FData>, headers: Headers, conn: DbConn)
         err!("Error registering U2F token")
     }
 
-    let registration = U2F.register_response(challenge.clone(), response.into())?;
+    let registration = U2F.register_response(challenge, response.into())?;
     let full_registration = U2FRegistration {
         id: data.Id.into_i32()?,
         name: data.Name,
@@ -192,6 +198,50 @@ fn activate_u2f(data: JsonUpcase<EnableU2FData>, headers: Headers, conn: DbConn)
 #[put("/two-factor/u2f", data = "<data>")]
 fn activate_u2f_put(data: JsonUpcase<EnableU2FData>, headers: Headers, conn: DbConn) -> JsonResult {
     activate_u2f(data, headers, conn)
+}
+
+#[derive(Deserialize, Debug)]
+#[allow(non_snake_case)]
+struct DeleteU2FData {
+    Id: NumberOrString,
+    MasterPasswordHash: String,
+}
+
+#[delete("/two-factor/u2f", data = "<data>")]
+fn delete_u2f(data: JsonUpcase<DeleteU2FData>, headers: Headers, conn: DbConn) -> JsonResult {
+    let data: DeleteU2FData = data.into_inner().data;
+
+    let id = data.Id.into_i32()?;
+
+    if !headers.user.check_valid_password(&data.MasterPasswordHash) {
+        err!("Invalid password");
+    }
+
+    let type_ = TwoFactorType::U2f as i32;
+    let mut tf = match TwoFactor::find_by_user_and_type(&headers.user.uuid, type_, &conn) {
+        Some(tf) => tf,
+        None => err!("U2F data not found!"),
+    };
+
+    let mut data: Vec<U2FRegistration> = match serde_json::from_str(&tf.data) {
+        Ok(d) => d,
+        Err(_) => err!("Error parsing U2F data"),
+    };
+
+    data.retain(|r| r.id != id);
+
+    let new_data_str = serde_json::to_string(&data)?;
+
+    tf.data = new_data_str;
+    tf.save(&conn)?;
+
+    let keys_json: Vec<Value> = data.iter().map(U2FRegistration::to_json).collect();
+
+    Ok(Json(json!({
+        "Enabled": true,
+        "Keys": keys_json,
+        "Object": "twoFactorU2f"
+    })))
 }
 
 fn _create_u2f_challenge(user_uuid: &str, type_: TwoFactorType, conn: &DbConn) -> Challenge {

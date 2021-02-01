@@ -2,31 +2,28 @@ use chrono::Utc;
 use data_encoding::BASE64;
 use rocket::Route;
 use rocket_contrib::json::Json;
-use serde_json;
 
-use crate::api::{ApiResult, EmptyResult, JsonResult, JsonUpcase, PasswordData};
-use crate::auth::Headers;
-use crate::crypto;
-use crate::db::{
-    models::{TwoFactor, TwoFactorType, User},
-    DbConn,
+use crate::{
+    api::{core::two_factor::_generate_recover_code, ApiResult, EmptyResult, JsonResult, JsonUpcase, PasswordData},
+    auth::Headers,
+    crypto,
+    db::{
+        models::{TwoFactor, TwoFactorType, User},
+        DbConn,
+    },
+    error::MapResult,
+    CONFIG,
 };
-use crate::error::MapResult;
-use crate::CONFIG;
 
 pub fn routes() -> Vec<Route> {
-    routes![
-        get_duo,
-        activate_duo,
-        activate_duo_put,
-    ]
+    routes![get_duo, activate_duo, activate_duo_put,]
 }
 
 #[derive(Serialize, Deserialize)]
 struct DuoData {
-    host: String,
-    ik: String,
-    sk: String,
+    host: String, // Duo API hostname
+    ik: String,   // integration key
+    sk: String,   // secret key
 }
 
 impl DuoData {
@@ -152,8 +149,9 @@ fn check_duo_fields_custom(data: &EnableDuoData) -> bool {
 #[post("/two-factor/duo", data = "<data>")]
 fn activate_duo(data: JsonUpcase<EnableDuoData>, headers: Headers, conn: DbConn) -> JsonResult {
     let data: EnableDuoData = data.into_inner().data;
+    let mut user = headers.user;
 
-    if !headers.user.check_valid_password(&data.MasterPasswordHash) {
+    if !user.check_valid_password(&data.MasterPasswordHash) {
         err!("Invalid password");
     }
 
@@ -167,8 +165,10 @@ fn activate_duo(data: JsonUpcase<EnableDuoData>, headers: Headers, conn: DbConn)
     };
 
     let type_ = TwoFactorType::Duo;
-    let twofactor = TwoFactor::new(headers.user.uuid.clone(), type_, data_str);
+    let twofactor = TwoFactor::new(user.uuid.clone(), type_, data_str);
     twofactor.save(&conn)?;
+
+    _generate_recover_code(&mut user, &conn);
 
     Ok(Json(json!({
         "Enabled": true,
@@ -187,9 +187,10 @@ fn activate_duo_put(data: JsonUpcase<EnableDuoData>, headers: Headers, conn: DbC
 fn duo_api_request(method: &str, path: &str, params: &str, data: &DuoData) -> EmptyResult {
     const AGENT: &str = "bitwarden_rs:Duo/1.0 (Rust)";
 
-    use reqwest::{header::*, Client, Method};
+    use reqwest::{blocking::Client, header::*, Method};
     use std::str::FromStr;
 
+    // https://duo.com/docs/authapi#api-details
     let url = format!("https://{}{}", &data.host, path);
     let date = Utc::now().to_rfc2822();
     let username = &data.ik;
@@ -268,6 +269,10 @@ fn sign_duo_values(key: &str, email: &str, ikey: &str, prefix: &str, expire: i64
 }
 
 pub fn validate_duo_login(email: &str, response: &str, conn: &DbConn) -> EmptyResult {
+    // email is as entered by the user, so it needs to be normalized before
+    // comparison with auth_user below.
+    let email = &email.to_lowercase();
+
     let split: Vec<&str> = response.split(':').collect();
     if split.len() != 2 {
         err!("Invalid response length");

@@ -1,22 +1,23 @@
 use data_encoding::BASE32;
 use rocket::Route;
 use rocket_contrib::json::Json;
-use serde_json;
 use serde_json::Value;
 
-use crate::api::{JsonResult, JsonUpcase, NumberOrString, PasswordData};
-use crate::auth::Headers;
-use crate::crypto;
-use crate::db::{
-    models::{TwoFactor, User},
-    DbConn,
+use crate::{
+    api::{JsonResult, JsonUpcase, NumberOrString, PasswordData},
+    auth::Headers,
+    crypto,
+    db::{
+        models::{TwoFactor, User},
+        DbConn,
+    },
 };
 
-pub(crate) mod authenticator;
-pub(crate) mod duo;
-pub(crate) mod email;
-pub(crate) mod u2f;
-pub(crate) mod yubikey;
+pub mod authenticator;
+pub mod duo;
+pub mod email;
+pub mod u2f;
+pub mod yubikey;
 
 pub fn routes() -> Vec<Route> {
     let mut routes = routes![
@@ -39,7 +40,7 @@ pub fn routes() -> Vec<Route> {
 #[get("/two-factor")]
 fn get_twofactor(headers: Headers, conn: DbConn) -> JsonResult {
     let twofactors = TwoFactor::find_by_user(&headers.user.uuid, &conn);
-    let twofactors_json: Vec<Value> = twofactors.iter().map(TwoFactor::to_json_list).collect();
+    let twofactors_json: Vec<Value> = twofactors.iter().map(TwoFactor::to_json_provider).collect();
 
     Ok(Json(json!({
         "Data": twofactors_json,
